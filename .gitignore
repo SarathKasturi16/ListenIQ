@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# Environment variables
+.env
+.env.local
+
+# HuggingFace model cache (can be GBs in size)
+.cache/
+~/.cache/huggingface/
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# Whisper / BART / RoBERTa downloaded weights
+whisper*/
+bart*/
+roberta*/
+bert*/
+
+# spaCy models
+en_core_web*/
+
+# Audio / Video uploads (user data, not source code)
+*.mp3
+*.mp4
+*.wav
+*.m4a
+*.mkv
+*.mov
+*.avi
+*.webm
+*.flac
+*.ogg
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / Editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
