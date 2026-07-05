@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
 """
-Core NLP Pipeline for VoxMind.
 Includes ASR (OpenAI Whisper-Tiny), Text Summarization (BART), and Extractive QA (RoBERTa + BERT-tiny).
 All models are lazily loaded.
 """
@@ -32,16 +30,117 @@ MODEL_WEIGHTS = {
 }
 
 
-def get_spacy_nlp():
-    """Lazily load and cache the spaCy model, auto-downloading it if missing."""
+# Audio Preprocessing
+def load_audio_waveform(audio_source, target_sr=16000):
+    """
+    Load an audio/video file and convert it into a waveform
+    suitable for Whisper (mono, 16 kHz, float32).
+    """
+
+    # Import pydub for audio decoding
+    try:
+        from pydub import AudioSegment
+    except ImportError as e:
+        raise RuntimeError(
+            "pydub is required for audio decoding. Install it with "
+            "'pip install pydub' (and ensure ffmpeg is installed and on PATH)."
+        ) from e
+
+    # Read the audio (ffmpeg handles extracting audio from video files)
+    try:
+        audio = AudioSegment.from_file(audio_source)
+    except Exception as e:
+        raise RuntimeError(
+            "Could not decode the audio. Ensure ffmpeg is installed "
+            f"and the file contains a valid audio track.\nOriginal error: {e}"
+        )
+
+    # Converting audio to Whisper's required format:
+    # 16 kHz sampling rate
+    # Mono (single channel)
+    audio = audio.set_frame_rate(target_sr).set_channels(1)
+
+    import numpy as np
+
+    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+
+    # Normalize integer samples to the range [-1, 1]
+    max_val = float(1 << (8 * audio.sample_width - 1))
+    samples /= max_val
+
+    return samples, target_sr
+
+
+def load_speech_pipeline():
+
+    # Access the global variable to avoid loading the model multiple times
+    global _speech_pipeline
+    if _speech_pipeline is None:
+        try:
+            _speech_pipeline = pipeline(
+                "automatic-speech-recognition",
+                model="openai/whisper-tiny",
+                device=device,
+                chunk_length_s=30,  # Process audio in 30-second chunks
+                stride_length_s=5,  # 5-second overlap between chunks
+            )
+        except Exception as e:
+            raise RuntimeError(f"Could not load Whisper model: {e}")
+    return _speech_pipeline
+
+
+# convert uploaded audio/video file into a transcript
+def transcribe_audio(audio_source, filename_hint=None):
+
+    if audio_source is None:
+        raise ValueError("No audio source provided.")
+
+    # If the input is raw bytes, convert it into a file-like object
+    if isinstance(audio_source, (bytes, bytearray)):
+        import io
+
+        buf = io.BytesIO(audio_source)
+        if filename_hint:
+            buf.name = filename_hint
+        audio_source = buf
+
+    # If a file path is given, verify that it exists
+    elif isinstance(audio_source, str):
+        if not os.path.exists(audio_source):
+            raise ValueError(f"Audio file path does not exist: {audio_source}")
+
+    # Load the Whisper ASR pipeline
+    asr = load_speech_pipeline()
+    try:
+        waveform, sampling_rate = load_audio_waveform(
+            audio_source
+        )  # Convert audio/video into a normalized waveform (NumPy array)
+
+        # Pass the waveform to Whisper for speech-to-text transcription
+        result = asr(
+            {"array": waveform, "sampling_rate": sampling_rate}, return_timestamps=True
+        )
+        return result.get("text", "").strip()
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Transcription failed: {e}")
+
+
+# SpaCy Used for
+# 1. Sentence Splitting
+# 2. POS (Part-of-Speech) Tagging
+
+
+# Load the spaCy English model
+def get_spacy_nlp():  # helper function
+
     global _nlp
+    # Load the model only once (Lazy Loading)
     if _nlp is None:
         try:
             _nlp = spacy.load("en_core_web_sm")
         except OSError:
-            # Model package not downloaded yet (common on a fresh install
-            # where 'python -m spacy download en_core_web_sm' was skipped).
-            # Download it programmatically instead of crashing.
             import subprocess
             import sys
 
@@ -57,7 +156,7 @@ def get_spacy_nlp():
 
 
 def load_qa_pipelines():
-    """Lazily load and cache QA models as pipelines."""
+
     global _qa_pipelines
     if _qa_pipelines is None:
         _qa_pipelines = []
@@ -68,12 +167,14 @@ def load_qa_pipelines():
         for model_name, model_tag in QA_MODELS:
             try:
                 qa = pipeline(
-                    "question-answering",
-                    model=model_name,
+                    "question-answering",  # Create a QA pipeline
+                    model=model_name,  # Load the pretrained model
                     tokenizer=AutoTokenizer.from_pretrained(model_name),
                     device=device,
                 )
-                _qa_pipelines.append((qa, model_tag))
+                _qa_pipelines.append(
+                    (qa, model_tag)
+                )  # Storing the pipeline along with its model name
             except Exception as e:
                 warnings.warn(f"Could not load QA model '{model_name}': {e}")
 
@@ -83,157 +184,38 @@ def load_qa_pipelines():
 
 
 def load_summary_pipeline():
-    """Lazily load and cache the BART summarization pipeline."""
+
     global _summary_pipeline
     if _summary_pipeline is None:
         try:
+            # Create a Hugging Face summarization pipeline using BART
             _summary_pipeline = pipeline(
                 "summarization",
-                model="facebook/bart-large-cnn",
+                model="facebook/bart-large-cnn",  # BART summarization model
                 device=device,
             )
         except Exception as e:
-            # Re-raise instead of swallowing: BART-large-CNN is ~1.6GB, so
-            # failures here are almost always a first-time download issue
-            # (no internet / blocked host) or an out-of-memory error. Hiding
-            # the real exception behind "not available" makes this
-            # impossible to diagnose.
             raise RuntimeError(
                 f"Could not load summarization model 'facebook/bart-large-cnn': {e}"
             ) from e
     return _summary_pipeline
 
 
-def load_speech_pipeline():
-    """
-    Lazily load and cache the Whisper-Tiny ASR pipeline.
-
-    IMPORTANT: chunk_length_s/stride_length_s are required for anything longer
-    than ~30s of audio. Whisper's encoder processes fixed 30s windows; without
-    chunking, the HF pipeline silently transcribes only the first 30 seconds
-    of any longer file and returns no error. Since this app targets meeting
-    and lecture audio (typically minutes long), chunking is mandatory, not
-    optional.
-    """
-    global _speech_pipeline
-    if _speech_pipeline is None:
-        try:
-            _speech_pipeline = pipeline(
-                "automatic-speech-recognition",
-                model="openai/whisper-tiny",
-                device=device,
-                chunk_length_s=30,
-                stride_length_s=5,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Could not load Whisper model: {e}")
-    return _speech_pipeline
-
-
-# --- Audio & Speech functions ---
-
-
-def load_audio_waveform(audio_source, target_sr=16000):
-    """
-    Decode any common audio OR video container (wav/mp3/m4a/mp4/mov/mkv/etc.)
-    into a mono 16kHz float32 numpy array using pydub (which wraps ffmpeg).
-
-    `audio_source` can be a file path OR an in-memory file-like object
-    (e.g. io.BytesIO) — pydub's AudioSegment.from_file accepts both, which
-    lets callers avoid writing anything to disk.
-
-    soundfile/librosa only natively read wav/flac/ogg; everything else
-    (compressed audio, and any video container) needs ffmpeg to demux/decode.
-    ffmpeg auto-detects the container format, so passing a video file here
-    works the same way as an audio file: ffmpeg extracts just the audio
-    stream and discards the video stream. No separate extraction step or
-    extra model is needed for video support — Whisper only ever sees audio.
-    """
-    try:
-        from pydub import AudioSegment
-    except ImportError as e:
-        raise RuntimeError(
-            "pydub is required for audio decoding. Install it with "
-            "'pip install pydub' (and ensure ffmpeg is installed and on PATH)."
-        ) from e
-
-    try:
-        audio = AudioSegment.from_file(audio_source)
-    except Exception as e:
-        raise RuntimeError(
-            f"Could not decode/extract audio. This usually means ffmpeg is "
-            f"not installed or not on PATH, or the file has no audio track. "
-            f"Install ffmpeg with 'sudo apt-get install ffmpeg' (Linux), "
-            f"'brew install ffmpeg' (Mac), or download it from "
-            f"https://ffmpeg.org/download.html (Windows). "
-            f"Original error: {e}"
-        )
-
-    audio = audio.set_frame_rate(target_sr).set_channels(1)
-
-    import numpy as np
-
-    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
-    # pydub gives integer PCM samples; normalize to [-1, 1] as Whisper expects
-    max_val = float(1 << (8 * audio.sample_width - 1))
-    samples /= max_val
-
-    return samples, target_sr
-
-
-def transcribe_audio(audio_source, filename_hint=None):
-    """
-    Transcribe speech from an audio OR video source using OpenAI Whisper-Tiny.
-
-    `audio_source` can be a file path, raw bytes, or an in-memory file-like
-    object (e.g. io.BytesIO from a Streamlit upload) — no temp file needed.
-    `filename_hint` (e.g. "clip.mp4") helps pydub/ffmpeg pick the right
-    decoder when `audio_source` is raw bytes/BytesIO with no extension info.
-    Video files are supported transparently: load_audio_waveform extracts
-    just the audio track via ffmpeg before this function ever sees it.
-    """
-    if audio_source is None:
-        raise ValueError("No audio source provided.")
-
-    if isinstance(audio_source, (bytes, bytearray)):
-        import io
-
-        buf = io.BytesIO(audio_source)
-        if filename_hint:
-            buf.name = filename_hint  # pydub/ffmpeg use this to infer format
-        audio_source = buf
-    elif isinstance(audio_source, str):
-        if not os.path.exists(audio_source):
-            raise ValueError(f"Audio file path does not exist: {audio_source}")
-
-    asr = load_speech_pipeline()
-    try:
-        waveform, sampling_rate = load_audio_waveform(audio_source)
-        # Pass a raw waveform dict instead of a file path: this avoids
-        # relying on soundfile/librosa's container auto-detection, which is
-        # what was failing on mp3 input.
-        result = asr(
-            {"array": waveform, "sampling_rate": sampling_rate}, return_timestamps=True
-        )
-        return result.get("text", "").strip()
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"Transcription failed: {e}")
-
-
-# --- Utility Functions ---
-
-
 def clean_answer(answer):
-    """Normalize whitespace and remove subword tokenization artifacts."""
-    answer = re.sub(r"\s+", " ", answer).strip()
-    answer = re.sub(r"##", "", answer)
+    # Normalize whitespace and remove subword tokenization artifacts
+
+    answer = re.sub(  # Replace multiple spaces/newlines with a single space
+        r"\s+", " ", answer
+    ).strip()
+    answer = re.sub(  # Remove subword tokenization markers ("play##ing" → "playing")
+        r"##", "", answer
+    )
     return answer
 
 
+# Refine the extracted answer to focus on the core entity for entity-type questions.
 def tighten_answer(answer, question):
-    """Refine the extracted answer to focus on the core entity for entity-type questions."""
+
     q = question.lower()
     if q.startswith(("identify", "which", "what")):
         answer = re.sub(r"^(the|a|an)\s+", "", answer, flags=re.IGNORECASE)
@@ -253,21 +235,18 @@ def is_descriptive_answer(answer):
 
 
 def validate_answer(question, answer, context, score):
-    """
-    Perform technical, linguistic, and confidence validation on the answer span.
-    Returns (is_valid: bool, reason: str). `reason` is only meaningful when
-    is_valid is False, and lets callers distinguish *why* validation failed
-    instead of always assuming a linguistic rejection.
-    """
-    if score < 0.1:
+
+    if score < 0.1:  # Reject answers with very low confidence
         return False, "low_confidence"
-    if not answer:
+    if not answer:  # Reject if no answer was extracted
         return False, "empty_answer"
+    # Reject overly long answers (likely not a precise answer)
     if len(answer.split()) > 20:
         return False, "answer_too_long"
+    # Ensure the extracted answer actually exists in the context
     if answer.lower() not in context.lower():
         return False, "not_in_context"
-
+    # For entity-based questions, reject answers that are only descriptive
     if question.lower().startswith(("which", "what", "who")):
         if is_descriptive_answer(answer):
             return False, "descriptive_not_entity"
@@ -275,14 +254,15 @@ def validate_answer(question, answer, context, score):
     return True, "ok"
 
 
+# Use spacy sentence segmenter to extract the exact sentence containing the answer.
 def extract_evidence(answer, context, max_chars=220):
-    """Use spaCy's sentence segmenter to extract the exact sentence containing the answer."""
+
     if not answer:
         return "No answer provided for evidence extraction."
 
     nlp = get_spacy_nlp()
     doc = nlp(context)
-
+    # Search for the sentence containing the extracted answer
     for sent in doc.sents:
         sent_text = sent.text.strip()
         if answer.lower() in sent_text.lower():
@@ -293,57 +273,58 @@ def extract_evidence(answer, context, max_chars=220):
     return "Relevant evidence sentence not found."
 
 
+# Split text into word chunks small enough to safely fit BART's 1024-token limit.
 def _chunk_text(text, max_words=350):
-    """Split text into word chunks small enough to safely fit BART's 1024-token limit."""
+    # Split the text into a list of words
     words = text.split()
-    return [" ".join(words[i : i + max_words]) for i in range(0, len(words), max_words)]
+
+    chunks = []
+
+    # Take 'max_words' words at a time
+    for i in range(0, len(words), max_words):
+        chunk = " ".join(words[i : i + max_words])
+        chunks.append(chunk)
+
+    return chunks
 
 
 def _summarize_chunk(pipeline_instance, text):
-    """Summarize a single chunk that's already within BART's input limit."""
     word_count = len(text.split())
-    max_len = min(120, max(20, word_count))
-    min_len = min(40, max(5, word_count // 3))
+    max_len = min(120, max(20, word_count))  # Set the maximum summary length
+    min_len = min(40, max(5, word_count // 3))  # Set the minimum summary length
+
+    # Generate the summary using the BART pipeline
     return pipeline_instance(
         text,
         max_length=max_len,
         min_length=min_len,
         do_sample=False,
-        truncation=True,
+        truncation=True,  # Truncate input if it exceeds BART's limit
     )[0]["summary_text"]
 
 
 def summarize_context(context, max_words_per_chunk=350):
-    """
-    Generate a summary of the given context, regardless of its length.
 
-    BART-large-CNN has a hard 1024-token input limit; passing a long
-    transcript straight through with truncation=True silently drops
-    everything past that point, so a 45-minute lecture only ever gets
-    summarized on roughly its first few minutes. To cover the entire
-    transcript, long input is split into word-count chunks (well under the
-    token limit, since tokens != words), each chunk is summarized
-    independently, and the combined chunk-summaries are summarized once
-    more into a final, cohesive summary.
-    """
     if not context or len(context.strip()) == 0:
         return "Context is empty."
 
     try:
+        # Load the BART summarization model
         pipeline_instance = load_summary_pipeline()
         word_count = len(context.split())
 
+        # If the text is short enough, summarize it directly
         if word_count <= max_words_per_chunk:
             return _summarize_chunk(pipeline_instance, context)
 
+        # Split the long transcript into smaller chunks
         chunks = _chunk_text(context, max_words_per_chunk)
         chunk_summaries = [
             _summarize_chunk(pipeline_instance, chunk) for chunk in chunks
         ]
         combined = " ".join(chunk_summaries)
 
-        # The combined chunk-summaries are usually short enough to summarize
-        # in one more pass; if they're still too long, recurse.
+        # if they're still too long recurse
         if len(combined.split()) > max_words_per_chunk:
             return summarize_context(combined, max_words_per_chunk)
 
@@ -352,14 +333,13 @@ def summarize_context(context, max_words_per_chunk=350):
         return f"Summarization failed: {e}"
 
 
-# --- Core QA Pipeline ---
+# Core QA Pipeline
+
+# Extract answers from context using an ensemble of QA models with weighted voting
 
 
 def reader_qa(question, context):
-    """
-    Extract answers from context using an ensemble of QA models with chunked inference,
-    weighted voting, and linguistic validation.
-    """
+    # if the question or transcript is empty
     if not question.strip() or not context.strip():
         return {
             "status": "REJECTED",
@@ -381,6 +361,7 @@ def reader_qa(question, context):
                 doc_stride=128,
             )
 
+            # Extract the predicted answer
             ans_text = result.get("answer", "")
             if ans_text and ans_text.strip():
                 cleaned = clean_answer(ans_text)
@@ -406,14 +387,10 @@ def reader_qa(question, context):
             "message": "No answer could be extracted from the context.",
         }
 
-    # Aggregate scores using a normalized key (lowercased, punctuation-stripped)
-    # so minor casing/punctuation differences between models (e.g. "Tokyo" vs
-    # "tokyo,") don't split votes that should reinforce one candidate. The
-    # best-scoring original surface form is kept for display.
     def normalize_key(text):
         return re.sub(r"[^\w\s]", "", text.lower()).strip()
 
-    candidate_scores = {}
+    candidate_scores = {}  # Store the total weighted score of each unique answer
     candidate_display = {}
     for a in answers:
         key = normalize_key(a["answer"])
@@ -424,19 +401,20 @@ def reader_qa(question, context):
     best_key = max(candidate_scores, key=candidate_scores.get)
     best_answer = candidate_display[best_key][0]
 
-    supporting_scores = [
-        a["score"] for a in answers if normalize_key(a["answer"]) == best_key
-    ]
-    confidence = max(supporting_scores) if supporting_scores else 0.0
+    supporting_scores = []
+    # Collect the confidence scores of models that predicted the winning answer
+    for a in answers:
+        if normalize_key(a["answer"]) == best_key:
+            supporting_scores.append(a["score"])
+
+    # Take the highest confidence score
+    if supporting_scores:
+        confidence = max(supporting_scores)
+    else:
+        confidence = 0.0
 
     is_valid, reason = validate_answer(question, best_answer, context, confidence)
     if not is_valid:
-        # Only the linguistic case ("looks like a description, not the
-        # named entity the question asked for") gets the "not explicitly
-        # stated" framing. Everything else gets its own accurate message —
-        # previously all rejection reasons (low confidence, answer too long,
-        # answer not actually in the context) were misreported with that
-        # same linguistic message, which was misleading.
         reason_messages = {
             "low_confidence": "The models could not find a confident enough answer in the context.",
             "empty_answer": "No answer could be extracted from the context.",

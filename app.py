@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Streamlit Web Application for VoxMind.
-Audio-first interface: speech transcription, summarization, and an
-interactive QA chatbot with answer highlighting.
-"""
-
 import html
 import os
 import re
@@ -18,12 +11,10 @@ from pipeline import (
 )
 
 st.set_page_config(
-    page_title="VoxMind | Interactive Meeting & Lecture Intelligence",
-    page_icon="🎙️",
+    page_title="ListenIQ",
     layout="wide",
 )
 
-# --- Minimal shared styling (one card style + one badge style, color via CSS var) ---
 st.markdown(
     """
 <style>
@@ -72,7 +63,7 @@ def badge(status, confidence=None):
 
 
 def render_qa_result(question, result, compact=False):
-    """Render one Q&A result. `compact=True` is used for the history list."""
+    """Render one Q&A result. compact=True is used for the history list."""
     color = STATUS_STYLE[result["status"]][0]
     if result["status"] == "ANSWERED":
         body = (
@@ -108,15 +99,7 @@ def render_qa_result(question, result, compact=False):
 
 
 def highlight_answer_in_context(context, answer):
-    """
-    Case-insensitive highlight of the answer span within the transcript HTML.
 
-    The transcript is escaped with html.escape() BEFORE highlighting, so any
-    literal '<', '>', '&', or quote characters that Whisper happens to
-    transcribe (or that end up in the text some other way) can't break the
-    page's HTML structure or be (mis)used for injection, since this is
-    rendered with unsafe_allow_html=True.
-    """
     escaped_context = html.escape(context)
     if not answer:
         return escaped_context.replace("\n", "<br>")
@@ -128,7 +111,7 @@ def highlight_answer_in_context(context, answer):
     return highlighted.replace("\n", "<br>")
 
 
-# --- State Initialization ---
+# State Initialization
 defaults = {
     "context": "",
     "summary": "",
@@ -139,26 +122,26 @@ defaults = {
 for key, value in defaults.items():
     st.session_state.setdefault(key, value)
 
-# --- Header ---
+# Header
 header_col, button_col = st.columns([5, 1])
 with header_col:
-    st.markdown('<div class="title-container">VOXMIND</div>', unsafe_allow_html=True)
+    st.markdown('<div class="title-container">ListenIQ</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="subtitle-text">Meeting, Lecture & Audio Intelligence — transcription, summarization, and Q&A.</div>',
+        '<div class="subtitle-text">Audio Intelligence — transcription, summarization, and Q&A.</div>',
         unsafe_allow_html=True,
     )
 with button_col:
-    if st.button("🧹 Clear Workspace"):
+    if st.button(" Clear Workspace"):
         for key, value in defaults.items():
             st.session_state[key] = value
         st.rerun()
 
 col1, col2 = st.columns([1.1, 0.9], gap="large")
 
-# --- Column 1: Audio input + transcript ---
+# Column 1: Audio input + transcript
 with col1:
     st.markdown(
-        '<div class="card-header">🎙️ Audio / Video Source</div>', unsafe_allow_html=True
+        '<div class="card-header">Audio / Video Source</div>', unsafe_allow_html=True
     )
     input_method = st.radio(
         "Select Source:",
@@ -191,21 +174,11 @@ with col1:
         if is_video:
             st.video(audio_bytes)
         else:
-            # Pass the correct MIME type, or the browser assumes WAV and
-            # silently refuses to play mp3/m4a bytes (player shows 0:00 / 0:00).
             st.audio(audio_bytes, format=audio_format)
 
-        if st.button("🔊 Transcribe & Analyze Audio", type="primary"):
+        if st.button("Transcribe & Analyze Audio", type="primary"):
             with st.spinner("Extracting audio and transcribing with Whisper..."):
                 try:
-                    # transcribe_audio accepts raw bytes directly — no temp
-                    # file is written to disk. Streamlit reruns this whole
-                    # script on every interaction (typing, clicking anything),
-                    # and a file uploaded once keeps being re-read on each of
-                    # those reruns; writing a fresh temp file every time and
-                    # only cleaning up the one tied to a button click leaked
-                    # an orphaned file per rerun. Working entirely in memory
-                    # removes that leak at the source.
                     transcript = transcribe_audio(
                         audio_bytes, filename_hint=filename_hint
                     )
@@ -243,11 +216,11 @@ with col1:
             "Upload or record audio, then click the transcribe button to see transcription and analysis."
         )
 
-# --- Column 2: Summary, Q&A ---
+# Column 2: Summary, Q&A
 with col2:
     if st.session_state["transcribed"] and st.session_state["context"]:
         st.markdown(
-            '<div class="card-header">🧠 AI Intelligence Analysis</div>',
+            '<div class="card-header">AI Intelligence Analysis</div>',
             unsafe_allow_html=True,
         )
         st.markdown(
